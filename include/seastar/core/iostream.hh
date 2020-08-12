@@ -231,6 +231,8 @@ public:
     /// Returns up to n bytes from the stream, or an empty buffer on end of
     /// stream.
     future<tmp_buf> read_up_to(size_t n);
+    /// Returns all bytes from the stream until eof, use only on short streams
+    future<tmp_buf> read_all();
     /// Detaches the \c input_stream from the underlying data source.
     ///
     /// Waits for any background operations (for example, read-ahead) to
@@ -245,6 +247,9 @@ public:
     }
     /// Ignores n next bytes from the stream.
     future<> skip(uint64_t n);
+
+    /// Ignores all bytes until eof
+    future<> skip_all();
 
     /// Detaches the underlying \c data_source from the \c input_stream.
     ///
