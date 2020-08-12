@@ -36,6 +36,7 @@
 #include <cctype>
 #include <vector>
 #include <seastar/http/httpd.hh>
+#include <seastar/http/internal/content_source.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/util/log.hh>
 
@@ -183,25 +184,29 @@ future<> connection::read() {
     });
 }
 
+// Create an input stream based on the requests body length
+static input_stream<char> make_content_stream(input_stream<char>& strm, size_t length) {
+    return input_stream<char>(data_source(std::make_unique<internal::content_length_source_impl>(strm, length)));
+}
+
 // Check if the request has a body, and if so read it. This function modifies
 // the request object with the newly read body, and returns the object for
 // further processing.
-// FIXME: reading the entire request body into a string req->_content is a
-// bad idea, because it may be very big. Instead, we should present to the
-// handler a req->_content_stream, an input stream that reads from the request
-// body - via a specialized input streams which reads exactly up to
-// Content-Length or decodes chunked-encoding.
 // FIXME: We currently support the case that there is a "Content-Length:"
 // header - chunked encoding is not yet supported.
 static future<std::unique_ptr<httpd::request>>
-read_request_body(input_stream<char>& buf, std::unique_ptr<httpd::request> req) {
-    if (!req->content_length) {
+set_request_content(std::unique_ptr<httpd::request> req, input_stream<char>& strm, bool streaming) {
+    req->content_stream_ptr = &strm;
+
+    if (streaming) {
         return make_ready_future<std::unique_ptr<httpd::request>>(std::move(req));
+    } else {
+        // Read the entire content into the request content string
+        return req->content_stream_ptr->read_all_contiguous().then([req = std::move(req)] (temporary_buffer<char> buf) mutable {
+            req->content = seastar::to_sstring(std::move(buf));
+            return make_ready_future<std::unique_ptr<httpd::request>>(std::move(req));
+        });
     }
-    return buf.read_exactly(req->content_length).then([req = std::move(req)] (temporary_buffer<char> body) mutable {
-        req->content = seastar::to_sstring(std::move(body));
-        return make_ready_future<std::unique_ptr<httpd::request>>(std::move(req));
-    });
 }
 
 void connection::generate_error_reply_and_close(std::unique_ptr<httpd::request> req, reply::status_type status, const sstring& msg) {
@@ -261,11 +266,20 @@ future<> connection::read_one() {
         };
 
         return maybe_reply_continue().then([this] (std::unique_ptr<httpd::request> req) {
-            return read_request_body(_read_buf, std::move(req)).then([this] (std::unique_ptr<httpd::request> req) {
-                return _replies.not_full().then([req = std::move(req), this] () mutable {
-                    return generate_reply(std::move(req));
-                }).then([this](bool done) {
-                    _done = done;
+            auto content_length = req->content_length;
+            return do_with(make_content_stream(_read_buf, content_length), [this, req = std::move(req)] (input_stream<char>& content_stream) mutable {
+                return set_request_content(std::move(req), content_stream, _server.get_content_streaming()).then([this, &content_stream] (std::unique_ptr<httpd::request> req) {
+                    return _replies.not_full().then([this, req = std::move(req), &content_stream] () mutable {
+                        return generate_reply(std::move(req));
+                    }).then([this, &content_stream](bool done) {
+                        _done = done;
+
+                        // check if entire content has been read and close the stream
+                        if (!content_stream.eof()) {
+                            _done = true;
+                        }
+                        return content_stream.close();
+                    });
                 });
             });
         });
@@ -437,6 +451,14 @@ size_t http_server::get_content_length_limit() const {
 
 void http_server::set_content_length_limit(size_t limit) {
     _content_length_limit = limit;
+}
+
+bool http_server::get_content_streaming() const {
+    return _content_streaming;
+}
+
+void http_server::set_content_streaming(bool b) {
+    _content_streaming = b;
 }
 
 future<> http_server::listen(socket_address addr, listen_options lo) {

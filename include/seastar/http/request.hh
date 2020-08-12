@@ -30,6 +30,7 @@
 //
 #pragma once
 
+#include <seastar/core/iostream.hh>
 #include <seastar/core/sstring.hh>
 #include <string>
 #include <vector>
@@ -75,7 +76,12 @@ struct request {
     std::unordered_map<sstring, sstring> query_parameters;
     connection* connection_ptr;
     parameters param;
-    sstring content;
+    sstring content; // deprecated: use content_stream_ptr instead
+    /*
+     * If the handler wants to keep using the same connection for another request, the content_stream must be read to completion.
+     * The stream should not be closed by the handler, the server will close it for the handler.
+     * */
+    input_stream<char>* content_stream_ptr;
     sstring protocol_name = "http";
 
     /**
