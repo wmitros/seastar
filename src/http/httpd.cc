@@ -184,28 +184,34 @@ future<> connection::read() {
     });
 }
 
-// Create an input stream based on the requests body length
-static input_stream<char> make_content_stream(input_stream<char>& buf, internal::content_stream_state& state, size_t length) {
-    return input_stream<char>(data_source(std::make_unique<internal::content_length_source_impl>(buf, state, length)));
+// Create an input stream based on the requests body encoding or lack thereof
+static input_stream<char> make_content_stream(input_stream<char>& buf, internal::content_stream_state& state, sstring encoding, size_t length) {
+    if (request::case_insensitive_cmp()(encoding, "chunked")) {
+        return input_stream<char>(data_source(std::make_unique<internal::chunked_source_impl>(buf, state)));
+    } else {
+        return input_stream<char>(data_source(std::make_unique<internal::content_length_source_impl>(buf, state, length)));
+    }
 }
 
-// Check if the request has a body, and if so read it. This function modifies
-// the request object with the newly read body, and returns the object for
-// further processing.
-// FIXME: We currently support the case that there is a "Content-Length:"
-// header - chunked encoding is not yet supported.
 static future<std::unique_ptr<httpd::request>>
-set_request_content(std::unique_ptr<httpd::request> req, input_stream<char>& strm, internal::content_stream_state& state, bool streaming) {
-    req->content_stream = make_content_stream(strm, state, req->content_length);
+set_request_content(std::unique_ptr<httpd::request> req, input_stream<char>& strm, internal::content_stream_state& state, bool streaming, connection* conn) {
+    req->content_stream = make_content_stream(strm, state, req->get_header("Transfer-Encoding"), req->content_length);
 
     if (streaming) {
         return make_ready_future<std::unique_ptr<httpd::request>>(std::move(req));
     } else {
-        // Read the entire content into the request content string
-        return req->content_stream.read_all().then([req = std::move(req)] (temporary_buffer<char> body) mutable {
-            req->content = seastar::to_sstring(std::move(body));
-            return req->content_stream.close().then([req = std::move(req)] () mutable {
-                return make_ready_future<std::unique_ptr<httpd::request>>(std::move(req));
+        return do_with(std::move(req), [conn] (std::unique_ptr<httpd::request>& req) {
+            // Read the entire content into the request content string
+            return req->content_stream.read_all().then([&req] (temporary_buffer<char> body) {
+                req->content = seastar::to_sstring(std::move(body));
+                return req->content_stream.close().then([&req] {
+                    return make_ready_future<std::unique_ptr<httpd::request>>(std::move(req));
+                });
+            }).handle_exception_type([conn, &req] (const base_exception& e) mutable {
+                // We might have failed to read the entire request content if the "Transfer-Encoding" header contained
+                // "chunked" - an exception would be thrown while trying to read a bad chunk
+                conn->generate_error_reply_and_close(std::move(req), e.status(), e.str());
+                return make_ready_future<std::unique_ptr<httpd::request>>();
             });
         });
     }
@@ -252,6 +258,13 @@ future<> connection::read_one() {
             return make_ready_future<>();
         }
 
+        sstring encoding = req->get_header("Transfer-Encoding");
+        if (encoding.size() && !request::case_insensitive_cmp()(encoding, "chunked")){
+            //TODO: add "identity", "gzip"("x-gzip"), "compress"("x-compress"), and "deflate" encodings and their combinations
+            generate_error_reply_and_close(std::move(req), reply::status_type::not_implemented, "Encodings other than \"chunked\" are not implemented");
+            return make_ready_future<>();
+        }
+
         auto maybe_reply_continue = [this, req = std::move(req)] () mutable {
             if (req->_version == "1.1" && request::case_insensitive_cmp()(req->get_header("Expect"), "100-continue")){
                 return _replies.not_full().then([req = std::move(req), this] () mutable {
@@ -269,7 +282,11 @@ future<> connection::read_one() {
 
         return maybe_reply_continue().then([this] (std::unique_ptr<httpd::request> req) {
             return do_with(internal::content_stream_state(), [this, req = std::move(req)] (internal::content_stream_state& state) mutable {
-                return set_request_content(std::move(req), _read_buf, state, _server.get_content_streaming()).then([this, &state] (std::unique_ptr<httpd::request> req) {
+                return set_request_content(std::move(req), _read_buf, state, _server.get_content_streaming(), this).then([this, &state] (std::unique_ptr<httpd::request> req) mutable {
+                    if (!req) {
+                        // an error was thrown while setting the request content
+                        return make_ready_future<>();
+                    }
                     return _replies.not_full().then([req = std::move(req), this, &state] () mutable {
                         return generate_reply(std::move(req));
                     }).then([this, &state](bool done) {

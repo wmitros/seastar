@@ -78,7 +78,7 @@ struct request {
     parameters param;
     sstring content; // deprecated: use content_stream instead
     /*
-     * must be read to completion by the handler and closed
+     * must be read to completion (until eof) by the handler and closed
      * */
     input_stream<char> content_stream;
     sstring protocol_name = "http";
