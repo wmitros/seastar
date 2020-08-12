@@ -908,6 +908,22 @@ SEASTAR_TEST_CASE(test_streamed_content) {
             resp = input.read().get0();
             BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("second request"), std::string::npos);
 
+            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")).get();
+            output.write(sstring("a\r\n1234567890\r\n")).get();
+            output.write(sstring("a\r\n1234521345\r\n")).get();
+            output.write(sstring("0\r\n\r\n")).get();
+            output.flush().get();
+            resp = input.read().get0();
+            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("12345678901234521345"), std::string::npos);
+
+            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")).get();
+            output.write(sstring("B\r\nsecond\r\nreq\r\n")).get();
+            output.write(sstring("4\r\nuest\r\n")).get();
+            output.write(sstring("0\r\n\r\n")).get();
+            output.flush().get();
+            resp = input.read().get0();
+            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("second\r\nrequest"), std::string::npos);
+
             input.close().get();
             output.close().get();
         });
@@ -953,6 +969,22 @@ SEASTAR_TEST_CASE(test_string_content) {
             resp = input.read().get0();
             BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("second request"), std::string::npos);
 
+            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")).get();
+            output.write(sstring("a\r\n1234567890\r\n")).get();
+            output.write(sstring("a\r\n1234521345\r\n")).get();
+            output.write(sstring("0\r\n\r\n")).get();
+            output.flush().get();
+            resp = input.read().get0();
+            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("12345678901234521345"), std::string::npos);
+
+            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")).get();
+            output.write(sstring("B\r\nsecond\r\nreq\r\n")).get();
+            output.write(sstring("4\r\nuest\r\n")).get();
+            output.write(sstring("0\r\n\r\n")).get();
+            output.flush().get();
+            resp = input.read().get0();
+            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("second\r\nrequest"), std::string::npos);
+
             input.close().get();
             output.close().get();
         });
@@ -968,6 +1000,79 @@ SEASTAR_TEST_CASE(test_string_content) {
         server.stop().get();
     });
 }
+
+SEASTAR_TEST_CASE(test_too_long_chunk) {
+    return seastar::async([] {
+        loopback_connection_factory lcf;
+        http_server server("test");
+        server.set_content_streaming(true);
+        loopback_socket_impl lsi(lcf);
+        httpd::http_server_tester::listeners(server).emplace_back(lcf.get_server_socket());
+        future<> client = seastar::async([&lsi, &server] {
+            connected_socket c_socket = std::get<connected_socket>(lsi.connect(socket_address(ipv4_addr()), socket_address(ipv4_addr())).get());
+            input_stream<char> input(c_socket.input());
+            output_stream<char> output(c_socket.output());
+
+            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")).get();
+            output.write(sstring("a\r\n1234567890\r\n")).get();
+            output.write(sstring("a\r\n1234521345X\r\n")).get();
+            output.write(sstring("0\r\n\r\n")).get();
+            output.flush().get();
+            auto resp = input.read().get0();
+            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("400 Bad Request"), std::string::npos);
+
+            input.close().get();
+            output.close().get();
+        });
+
+        future<> writer = seastar::async([&server] {
+            auto handler = new stream_handler();
+            server._routes.put(GET, "/test", handler);
+            server.do_accepts(0).get();
+        });
+
+        client.get();
+        writer.get();
+        server.stop().get();
+    });
+}
+
+SEASTAR_TEST_CASE(test_bad_chunk_length) {
+    return seastar::async([] {
+        loopback_connection_factory lcf;
+        http_server server("test");
+        server.set_content_streaming(true);
+        loopback_socket_impl lsi(lcf);
+        httpd::http_server_tester::listeners(server).emplace_back(lcf.get_server_socket());
+        future<> client = seastar::async([&lsi, &server] {
+            connected_socket c_socket = std::get<connected_socket>(lsi.connect(socket_address(ipv4_addr()), socket_address(ipv4_addr())).get());
+            input_stream<char> input(c_socket.input());
+            output_stream<char> output(c_socket.output());
+
+            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")).get();
+            output.write(sstring("a\r\n1234567890\r\n")).get();
+            output.write(sstring("aX\r\n1234521345\r\n")).get();
+            output.write(sstring("0\r\n\r\n")).get();
+            output.flush().get();
+            auto resp = input.read().get0();
+            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("400 Bad Request"), std::string::npos);
+
+            input.close().get();
+            output.close().get();
+        });
+
+        future<> writer = seastar::async([&server] {
+            auto handler = new stream_handler();
+            server._routes.put(GET, "/test", handler);
+            server.do_accepts(0).get();
+        });
+
+        client.get();
+        writer.get();
+        server.stop().get();
+    });
+}
+
 
 SEASTAR_TEST_CASE(case_insensitive_header) {
     std::unique_ptr<seastar::httpd::request> req = std::make_unique<seastar::httpd::request>();

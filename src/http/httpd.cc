@@ -184,27 +184,21 @@ future<> connection::read() {
     });
 }
 
-// Create an input stream based on the requests body length
-static input_stream<char> make_content_stream(input_stream<char>& buf, size_t length) {
-    return input_stream<char>(data_source(std::make_unique<length_source_impl>(buf, length)));
+// Create an input stream based on the requests body encoding or lack thereof
+static input_stream<char> make_content_stream(input_stream<char>& buf, sstring encoding, size_t length) {
+    if (request::case_insensitive_cmp()(encoding, "chunked")) {
+        return input_stream<char>(data_source(std::make_unique<chunked_source_impl>(buf)));
+    } else {
+        return input_stream<char>(data_source(std::make_unique<length_source_impl>(buf, length)));
+    }
 }
 
 // Check if the request has a body, and if so read it. This function modifies
 // the request object with the newly read body, and returns the object for
 // further processing.
-// FIXME: reading the entire request body into a string req->_content is a
-// bad idea, because it may be very big. Instead, we should present to the
-// handler a req->_content_stream, an input stream that reads from the request
-// body - via a specialized input streams which reads exactly up to
-// Content-Length or decodes chunked-encoding.
-// FIXME: We currently support the case that there is a "Content-Length:"
-// header - chunked encoding is not yet supported.
 static future<std::unique_ptr<httpd::request>>
-read_request_body(lw_shared_ptr<input_stream<char>> buf, std::unique_ptr<httpd::request> req) {
-    if (!req->content_length) {
-        return make_ready_future<std::unique_ptr<httpd::request>>(std::move(req));
-    }
-    return buf->read_exactly(req->content_length).then([req = std::move(req), buf] (temporary_buffer<char> body) mutable {
+read_request_body(lw_shared_ptr<input_stream<char>> content_stream, std::unique_ptr<httpd::request> req) {
+    return content_stream->read_all().then([req = std::move(req)] (temporary_buffer<char> body) mutable {
         req->content = seastar::to_sstring(std::move(body));
         return make_ready_future<std::unique_ptr<httpd::request>>(std::move(req));
     });
@@ -269,7 +263,7 @@ future<> connection::read_one() {
         };
 
         return maybe_reply_continue().then([this] (std::unique_ptr<httpd::request> req) {
-            auto content_stream = make_lw_shared(make_content_stream(_read_buf, req->content_length));
+            auto content_stream = make_lw_shared(make_content_stream(_read_buf, req->get_header("Transfer-Encoding"), req->content_length));
             return make_request_content(content_stream, std::move(req), _server.get_content_streaming()).then([this, content_stream] (std::unique_ptr<httpd::request> req) {
                 return _replies.not_full().then([req = std::move(req), this, content_stream] () mutable {
                     return generate_reply(std::move(req));
