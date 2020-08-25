@@ -279,6 +279,38 @@ input_stream<CharType>::read() {
 }
 
 template <typename CharType>
+future<temporary_buffer<CharType>>
+input_stream<CharType>::read_all() {
+    using tmp_buf = temporary_buffer<CharType>;
+    using consumption_result_type = consumption_result<CharType>;
+    return do_with(std::vector<tmp_buf>(), size_t(0), [this] (std::vector<tmp_buf>& bufs, size_t& total_length) {
+        return this->consume([this, &bufs, &total_length] (tmp_buf buf) {
+            if (buf.empty()) {
+                return make_ready_future<consumption_result_type>(stop_consuming(std::move(buf)));
+            }
+            total_length += buf.size();
+            bufs.push_back(std::move(buf));
+            return make_ready_future<consumption_result_type>(continue_consuming());
+        }).then([this, &bufs, &total_length] {
+            if (bufs.size() == 0) {
+                return tmp_buf();
+            }
+            if (bufs.size() == 1) {
+                // no need to copy
+                return std::move(bufs.front());
+            }
+            tmp_buf ret(total_length);
+            size_t copied_length = 0;
+            for (auto& b : bufs) {
+                std::copy(b.get(), b.get() + b.size(), ret.get_write() + copied_length);
+                copied_length += b.size();
+            }
+            return ret;
+        });
+    });
+}
+
+template <typename CharType>
 future<>
 input_stream<CharType>::skip(uint64_t n) {
     auto skip_buf = std::min(n, _buf.size());
@@ -289,6 +321,15 @@ input_stream<CharType>::skip(uint64_t n) {
     }
     return _fd.skip(n).then([this] (temporary_buffer<CharType> buffer) {
         _buf = std::move(buffer);
+    });
+}
+
+template <typename CharType>
+future<>
+input_stream<CharType>::skip_all() {
+    return this->consume([this] (temporary_buffer<char> tmp) {
+        return tmp.empty() ? make_ready_future<consumption_result<CharType>>(stop_consuming(temporary_buffer<CharType>()))
+                           : make_ready_future<consumption_result<CharType>>(continue_consuming());
     });
 }
 
