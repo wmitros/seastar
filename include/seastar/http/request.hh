@@ -82,6 +82,8 @@ struct request {
      * The stream should not be closed by the handler, the server will close it for the handler.
      * */
     input_stream<char>* content_stream_ptr;
+    std::unordered_map<sstring, sstring> trailing_headers;
+    std::unordered_map<sstring, sstring> chunk_extensions;
     sstring protocol_name = "http";
 
     /**
